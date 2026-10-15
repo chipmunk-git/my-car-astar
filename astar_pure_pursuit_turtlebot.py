@@ -5,6 +5,8 @@
 A*의 정확한 비용 계산과 TF 기반 위치 추적 등 기존 구현은 유지합니다.
 실시간 /scan 충돌 방지 기능이 없으므로 실제 로봇은 통제된 공간에서만 사용하세요.
 다른 /cmd_vel 제어 노드와 동시에 실행하지 마세요.
+--mode detect는 /image_raw의 YOLOv8 검출 화면만 독립 실행합니다.
+검출 결과에 따른 주행 정지는 아직 구현되어 있지 않습니다.
 """
 
 import heapq
@@ -449,5 +451,250 @@ def main(args=None):
         rclpy.shutdown()
 
 
+class YoloImageDetector(Node):
+    """주행 상태를 공유하지 않고 최신 카메라 메시지 한 개만 보관합니다."""
+
+    def __init__(self):
+        import threading
+
+        from sensor_msgs.msg import Image
+
+        super().__init__('yolo_image_detector')
+        self.declare_parameter('image_topic', '/image_raw')
+        self.declare_parameter('model_path', 'resources/yolov8n.pt')
+        self.declare_parameter('confidence_threshold', 0.25)
+        self.declare_parameter('image_size', 640)
+        self.declare_parameter('device', '')
+        self.declare_parameter('image_timeout', 2.0)
+
+        self.image_topic = str(self.get_parameter('image_topic').value).strip()
+        self.model_path = str(self.get_parameter('model_path').value).strip()
+        self.confidence = float(self.get_parameter('confidence_threshold').value)
+        self.image_size = int(self.get_parameter('image_size').value)
+        self.device = str(self.get_parameter('device').value).strip()
+        self.image_timeout = float(self.get_parameter('image_timeout').value)
+        if not self.image_topic or not self.model_path:
+            raise ValueError('image_topic과 model_path는 비어 있을 수 없습니다.')
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError('confidence_threshold는 0~1 범위여야 합니다.')
+        if self.image_size <= 0:
+            raise ValueError('image_size는 양수여야 합니다.')
+        if not math.isfinite(self.image_timeout) or self.image_timeout <= 0.0:
+            raise ValueError('image_timeout은 양수여야 합니다.')
+
+        self._image_lock = threading.Lock()
+        self._latest_image = None
+        image_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(Image, self.image_topic, self.image_callback, image_qos)
+        self.get_logger().info(
+            f'검출 모드: {self.image_topic}, model={self.model_path}, '
+            f'conf={self.confidence}, imgsz={self.image_size}. '
+            '/cmd_vel을 발행하지 않습니다. ESC 또는 q로 화면을 종료합니다.'
+        )
+
+    def image_callback(self, msg):
+        # 변환·추론은 여기서 하지 않습니다. 수신 중에는 이전 메시지를 덮어씁니다.
+        with self._image_lock:
+            self._latest_image = (msg, time.monotonic())
+
+    def take_latest_image(self):
+        with self._image_lock:
+            sample = self._latest_image
+            self._latest_image = None
+        return sample
+
+
+def detect_main(args=None):
+    """검출용 의존성은 이 모드에서만 로드하고 GUI는 메인 스레드에서 처리합니다."""
+    import os
+    import threading
+    from collections import deque
+    from pathlib import Path as FilePath
+
+    from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+
+    try:
+        import cv2
+        from cv_bridge import CvBridge
+        from ultralytics import YOLO
+    except ImportError as exc:
+        print(f'검출 모드 의존성을 불러오지 못했습니다: {exc}')
+        return 1
+
+    node = None
+    executor = None
+    receiver = None
+    stop_event = threading.Event()
+    receiver_errors = []
+    window_name = 'TurtleBot3 YOLOv8 - ESC / q to quit'
+    window_created = False
+    rclpy.init(args=args)
+    try:
+        node = YoloImageDetector()
+        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            raise RuntimeError('검출 화면을 표시할 데스크톱 세션이 필요합니다.')
+        bridge = CvBridge()
+        # 상대 경로는 이 Python 파일이 있는 폴더를 기준으로 해석합니다.
+        model_path = FilePath(node.model_path).expanduser()
+        if not model_path.is_absolute():
+            model_path = FilePath(__file__).resolve().parent / model_path
+        model = YOLO(str(model_path))
+        predict_options = {
+            'conf': node.confidence,
+            'imgsz': node.image_size,
+            'verbose': False,
+        }
+        if node.device:
+            predict_options['device'] = node.device
+
+        executor = SingleThreadedExecutor(context=node.context)
+        executor.add_node(node)
+
+        def receive_images():
+            try:
+                while rclpy.ok() and not stop_event.is_set():
+                    executor.spin_once(timeout_sec=0.1)
+            except ExternalShutdownException:
+                pass
+            except Exception as exc:
+                if rclpy.ok() and not stop_event.is_set():
+                    receiver_errors.append(exc)
+                    stop_event.set()
+
+        receiver = threading.Thread(target=receive_images, name='yolo_image_receiver')
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        window_created = True
+        receiver.start()
+        completed_times = deque()
+        last_image = np.zeros((480, 640, 3), dtype=np.uint8)
+        last_received = None
+        inference_ms = None
+        encoding_logged = False
+        stream_stale = False
+
+        while rclpy.ok() and not stop_event.is_set():
+            sample = node.take_latest_image()
+            if sample is not None:
+                msg, received_at = sample
+                last_received = received_at
+                if time.monotonic() - received_at <= node.image_timeout:
+                    if not encoding_logged:
+                        node.get_logger().info(
+                            f'영상 수신: {msg.width}x{msg.height}, encoding={msg.encoding}'
+                        )
+                        encoding_logged = True
+                    frame = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+                    result = model.predict(source=frame, **predict_options)[0]
+                    last_image = result.plot(boxes=True, labels=True, conf=True)
+                    inference_ms = result.speed.get('inference')
+                    completed_times.append(time.monotonic())
+
+            now = time.monotonic()
+            while completed_times and now - completed_times[0] > 2.0:
+                completed_times.popleft()
+            fps = 0.0
+            if len(completed_times) >= 2:
+                elapsed = completed_times[-1] - completed_times[0]
+                if elapsed > 0.0:
+                    fps = (len(completed_times) - 1) / elapsed
+            age = None if last_received is None else now - last_received
+            stale = age is not None and age > node.image_timeout
+            if stale and not stream_stale:
+                node.get_logger().warn('영상 갱신이 중단되었습니다. 마지막 화면을 표시합니다.')
+            elif stream_stale and age is not None and not stale:
+                node.get_logger().info('영상 수신이 다시 갱신됩니다.')
+            stream_stale = stale
+
+            # 수신 시각은 Remote PC의 콜백 실행 시각이며 촬영 시각이 아닙니다.
+            display = last_image.copy()
+            inference_text = '--' if inference_ms is None else f'{inference_ms:.1f} ms'
+            age_text = '--' if age is None else f'{age:.2f} s'
+            status = 'Waiting for image' if age is None else (
+                'IMAGE STREAM TIMEOUT' if stale else 'Receiving images'
+            )
+            lines = (
+                status,
+                f'Inference: {inference_text} | Process FPS: {fps:.1f}',
+                f'Receive age: {age_text} | ESC / q: quit',
+            )
+            color = (0, 0, 255) if stale else (0, 255, 0)
+            for i, line in enumerate(lines):
+                location = (10, 25 + i * 25)
+                cv2.putText(display, line, location, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(display, line, location, cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, color, 1, cv2.LINE_AA)
+            cv2.imshow(window_name, display)
+            if (cv2.waitKey(10) & 0xFF) in (27, ord('q')):
+                break
+            # 일부 GUI 백엔드는 이 속성을 지원하지 않으므로 ESC/q도 제공합니다.
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) == 0.0:
+                    break
+            except cv2.error:
+                pass
+
+        if receiver_errors:
+            raise RuntimeError(f'영상 구독 처리 실패: {receiver_errors[0]}')
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except Exception as exc:
+        if node is not None:
+            node.get_logger().error(f'검출 모드 실행 실패: {exc}')
+        else:
+            print(f'검출 모드 초기화 실패: {exc}')
+        return 1
+    finally:
+        stop_event.set()
+        # spin_once의 짧은 대기가 끝난 뒤 수신 스레드를 먼저 정리합니다.
+        if receiver is not None and receiver.ident is not None:
+            receiver.join()
+        if executor is not None:
+            executor.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        if window_created:
+            cv2.destroyAllWindows()
+    return 0
+
+
+def dispatch(args=None):
+    """프로그램 옵션과 --ros-args ... [--] 구간을 분리합니다."""
+    import argparse
+    import sys
+
+    arguments = sys.argv[1:] if args is None else list(args)
+    app_args, ros_args = [], []
+    in_ros_args = False
+    for token in arguments:
+        if token == '--ros-args':
+            in_ros_args = True
+            ros_args.append(token)
+        elif in_ros_args:
+            ros_args.append(token)
+            if token == '--':
+                in_ros_args = False
+        else:
+            app_args.append(token)
+
+    parser = argparse.ArgumentParser(
+        description='TurtleBot3 A* / Pure Pursuit 주행 및 YOLOv8 검출 화면',
+        epilog='ROS2 파라미터는 --ros-args -p 이름:=값 형식으로 전달합니다.',
+        allow_abbrev=False,
+    )
+    parser.add_argument('--mode', choices=('drive', 'detect'), default='drive',
+                        help='실행 모드 (기본값: drive)')
+    options = parser.parse_args(app_args)
+    if options.mode == 'detect':
+        return detect_main(args=ros_args)
+    return main(args=ros_args)
+
+
 if __name__ == '__main__':
-    main()
+    raise SystemExit(dispatch())
