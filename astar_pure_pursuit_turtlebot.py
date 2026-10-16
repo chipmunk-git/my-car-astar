@@ -5,8 +5,8 @@
 A*의 정확한 비용 계산과 TF 기반 위치 추적 등 기존 구현은 유지합니다.
 실시간 /scan 충돌 방지 기능이 없으므로 실제 로봇은 통제된 공간에서만 사용하세요.
 다른 /cmd_vel 제어 노드와 동시에 실행하지 마세요.
---mode detect는 /image_raw의 YOLOv8 검출 화면만 독립 실행합니다.
-검출 결과에 따른 주행 정지는 아직 구현되어 있지 않습니다.
+--mode detect는 /image_raw의 YOLOv8 검출 화면을 표시합니다.
+YOLOv8 특정 객체 검출 시 ROS2 토픽으로 주행 노드에 정지를 요청합니다.
 """
 
 import heapq
@@ -18,6 +18,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
+from std_msgs.msg import Bool
 from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -157,6 +158,8 @@ class AStarPurePursuit(Node):
         self.declare_parameter('occupied_threshold', 50)
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('max_tf_age', 2.0)  # 오래된 TF를 이용한 주행 금지
+        self.declare_parameter('require_detector', False)  # True면 검출 상태 수신 전에도 정지
+        self.declare_parameter('stop_signal_timeout', 3.0)  # 검출 상태 수신 유효 시간(초)
 
         self.grid = None
         self.blocked = None
@@ -177,6 +180,13 @@ class AStarPurePursuit(Node):
         self.progress_index = 0
         self.need_plan = False
         self.was_driving = False
+        self.stop_requested = False
+        self.stop_signal_seen = False
+        self.last_stop_signal_time = None
+        self.last_detector_status = None
+        signal_timeout = float(self.get_parameter('stop_signal_timeout').value)
+        if not math.isfinite(signal_timeout) or signal_timeout <= 0:
+            raise ValueError('stop_signal_timeout은 양수여야 합니다.')
 
         map_qos = QoSProfile(
             depth=1,
@@ -187,6 +197,7 @@ class AStarPurePursuit(Node):
         self.tf_buffer = Buffer(node=self)
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        self.create_subscription(Bool, '/yolo/stop_requested', self.stop_request_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, '/astar_path', map_qos)
         control_period = max(0.05, float(self.get_parameter('control_period').value))
@@ -201,8 +212,36 @@ class AStarPurePursuit(Node):
             '유효한 지도/TF/목표가 있을 때만 주행합니다.'
         )
         self.get_logger().warn(
-            '정적 지도 기반 주행: 새로운 장애물을 감지해 자동 정지하는 기능은 없습니다.'
+            'YOLO 특정 객체 검출 정지는 지원하지만, /scan 기반의 범용 충돌 방지는 없습니다.'
         )
+        if bool(self.get_parameter('require_detector').value):
+            self.get_logger().info('require_detector=True: 검출 상태가 도착하기 전에는 주행하지 않습니다.')
+        else:
+            self.get_logger().info(
+                'require_detector=False: 첫 검출 상태 수신 전에는 검출 상태를 기다리지 않습니다.'
+            )
+
+    def stop_request_callback(self, msg):
+        """검출 프로세스의 최근 판단을 수신합니다. /cmd_vel은 이 노드만 발행합니다."""
+        self.stop_requested = bool(msg.data)
+        self.stop_signal_seen = True
+        self.last_stop_signal_time = time.monotonic()
+        # 타이머 다음 회차를 기다리지 않고 가능한 한 빨리 정지 명령을 보냅니다.
+        if self.stop_requested:
+            self.stop_robot()
+
+    def detector_stop_reason(self):
+        """정지할 이유(None이면 주행 가능)를 단조 시계로 판단합니다."""
+        if self.stop_requested:
+            return 'object'
+        if not self.stop_signal_seen:
+            if bool(self.get_parameter('require_detector').value):
+                return 'waiting'
+            return None
+        age = time.monotonic() - self.last_stop_signal_time
+        if age > float(self.get_parameter('stop_signal_timeout').value):
+            return 'stale'
+        return None
 
     def map_callback(self, msg):
         w, h = msg.info.width, msg.info.height
@@ -369,6 +408,23 @@ class AStarPurePursuit(Node):
         self.turn_in_place = False
 
     def control_loop(self):
+        # YOLO가 정지를 요청했거나 검출 상태가 끊겼다면 경로 추종보다 먼저 중지합니다.
+        stop_reason = self.detector_stop_reason()
+        if stop_reason is not None:
+            if self.last_detector_status != stop_reason:
+                reason_text = {
+                    'object': '지정한 YOLO 객체가 검출되어 정지합니다.',
+                    'waiting': '검출 상태 토픽을 기다립니다. 주행하지 않습니다.',
+                    'stale': '검출 상태 수신이 중단되어 정지합니다.',
+                }
+                self.get_logger().warn(reason_text[stop_reason])
+            self.last_detector_status = stop_reason
+            self.stop_robot()
+            return
+        if self.last_detector_status is not None:
+            self.get_logger().info('검출 상태가 정상이며 정지 요청이 해제되었습니다.')
+            self.last_detector_status = None
+
         # 설정한 제어 주기(control_period)마다 최신 TF에서 위치를 가져옵니다.
         # TF가 없거나 오래되었다면 경로가 있어도 주행하지 않습니다.
         if not self.update_pose_from_tf():
@@ -452,7 +508,7 @@ def main(args=None):
 
 
 class YoloImageDetector(Node):
-    """주행 상태를 공유하지 않고 최신 카메라 메시지 한 개만 보관합니다."""
+    """최신 카메라 메시지만 보관하고, 객체 검출 상태를 토픽으로 알립니다."""
 
     def __init__(self):
         import threading
@@ -466,6 +522,8 @@ class YoloImageDetector(Node):
         self.declare_parameter('image_size', 640)
         self.declare_parameter('device', '')
         self.declare_parameter('image_timeout', 2.0)
+        self.declare_parameter('stop_classes', 'scissors')  # 쉼표로 여러 COCO 클래스 지정 가능
+        self.declare_parameter('stop_hold_seconds', 1.0)  # 일시적인 미검출에 의한 즉시 재출발 억제
 
         self.image_topic = str(self.get_parameter('image_topic').value).strip()
         self.model_path = str(self.get_parameter('model_path').value).strip()
@@ -473,6 +531,12 @@ class YoloImageDetector(Node):
         self.image_size = int(self.get_parameter('image_size').value)
         self.device = str(self.get_parameter('device').value).strip()
         self.image_timeout = float(self.get_parameter('image_timeout').value)
+        self.stop_classes = {
+            name.strip().casefold()
+            for name in str(self.get_parameter('stop_classes').value).split(',')
+            if name.strip()
+        }
+        self.stop_hold_seconds = float(self.get_parameter('stop_hold_seconds').value)
         if not self.image_topic or not self.model_path:
             raise ValueError('image_topic과 model_path는 비어 있을 수 없습니다.')
         if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
@@ -481,6 +545,10 @@ class YoloImageDetector(Node):
             raise ValueError('image_size는 양수여야 합니다.')
         if not math.isfinite(self.image_timeout) or self.image_timeout <= 0.0:
             raise ValueError('image_timeout은 양수여야 합니다.')
+        if not self.stop_classes:
+            raise ValueError('stop_classes에는 최소 하나의 객체 클래스가 필요합니다.')
+        if not math.isfinite(self.stop_hold_seconds) or self.stop_hold_seconds < 0:
+            raise ValueError('stop_hold_seconds는 0 이상의 숫자여야 합니다.')
 
         self._image_lock = threading.Lock()
         self._latest_image = None
@@ -490,10 +558,14 @@ class YoloImageDetector(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(Image, self.image_topic, self.image_callback, image_qos)
+        self.stop_pub = self.create_publisher(Bool, '/yolo/stop_requested', 10)
+        self.last_published_stop = None
         self.get_logger().info(
             f'검출 모드: {self.image_topic}, model={self.model_path}, '
             f'conf={self.confidence}, imgsz={self.image_size}. '
-            '/cmd_vel을 발행하지 않습니다. ESC 또는 q로 화면을 종료합니다.'
+            f'stop_classes={sorted(self.stop_classes)}. '
+            '/yolo/stop_requested만 발행하며 /cmd_vel은 발행하지 않습니다. '
+            'ESC 또는 q로 화면을 종료합니다.'
         )
 
     def image_callback(self, msg):
@@ -506,6 +578,24 @@ class YoloImageDetector(Node):
             sample = self._latest_image
             self._latest_image = None
         return sample
+
+    def publish_stop_request(self, requested):
+        requested = bool(requested)
+        self.stop_pub.publish(Bool(data=requested))
+        if self.last_published_stop != requested:
+            status = '정지 요청' if requested else '정지 요청 해제'
+            self.get_logger().warn(f'YOLO 객체 검출 상태: {status}')
+        self.last_published_stop = requested
+
+
+def detected_labels(result):
+    """Ultralytics Results에서 검출된 클래스 이름들을 추출합니다."""
+    if result.boxes is None:
+        return set()
+    return {
+        str(result.names[int(cls)]).casefold()
+        for cls in result.boxes.cls.tolist()
+    }
 
 
 def detect_main(args=None):
@@ -575,6 +665,7 @@ def detect_main(args=None):
         inference_ms = None
         encoding_logged = False
         stream_stale = False
+        last_target_detected_at = None
 
         while rclpy.ok() and not stop_event.is_set():
             sample = node.take_latest_image()
@@ -589,6 +680,14 @@ def detect_main(args=None):
                         encoding_logged = True
                     frame = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
                     result = model.predict(source=frame, **predict_options)[0]
+                    labels = detected_labels(result)
+                    if labels & node.stop_classes:
+                        last_target_detected_at = time.monotonic()
+                    hold_active = (
+                        last_target_detected_at is not None
+                        and time.monotonic() - last_target_detected_at <= node.stop_hold_seconds
+                    )
+                    node.publish_stop_request(hold_active)
                     last_image = result.plot(boxes=True, labels=True, conf=True)
                     inference_ms = result.speed.get('inference')
                     completed_times.append(time.monotonic())
@@ -656,6 +755,12 @@ def detect_main(args=None):
         if executor is not None:
             executor.shutdown()
         if node is not None:
+            # 검출 화면 종료 시에도 주행 프로세스에 정지 요청을 보냅니다.
+            try:
+                if rclpy.ok():
+                    node.publish_stop_request(True)
+            except Exception:
+                pass
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

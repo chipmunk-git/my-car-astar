@@ -2,7 +2,7 @@
 
 ROS2 기반 TurtleBot3 Waffle-Pi 주행 프로젝트입니다. 정적 점유 지도에서 **A*로 경로를 계획**하고, TF에서 조회한 현재 위치를 이용하여 **Pure Pursuit 방식으로 경로를 추종**합니다.
 
-같은 Python 파일의 검출 모드에서는 **TurtleBot3 카메라 영상을 YOLOv8으로 처리하여 사각형·클래스 이름·신뢰도를 표시**합니다. 주행과 검출은 각각 별도 프로세스로 실행합니다.
+같은 Python 파일의 검출 모드에서는 **TurtleBot3 카메라 영상을 YOLOv8으로 처리하여 사각형·클래스 이름·신뢰도를 표시**합니다. 특정 객체가 검출되면 ROS2 토픽을 이용하여 주행 노드에 정지를 요청합니다. 주행과 검출은 각각 별도 프로세스로 실행합니다.
 
 ## 주요 기능
 
@@ -15,7 +15,7 @@ ROS2 기반 TurtleBot3 Waffle-Pi 주행 프로젝트입니다. 정적 점유 지
 - `/image_raw` 영상의 YOLOv8 객체 검출 및 OpenCV 화면 표시
 - 검출 화면에 추론 시간·처리 FPS·영상 갱신 상태 표시
 
-객체 검출 결과를 주행 정지에 연결하는 기능은 아직 구현되어 있지 않습니다.
+객체 검출 결과를 주행 정지에 연결하는 기능을 구현하였습니다. `scissors` 등 지정된 객체가 검출되면 `/yolo/stop_requested`로 정지 요청을 발행하고, 주행 노드는 `/cmd_vel`에 영(0) 속도의 `Twist`를 발행합니다. 검출 상태 수신 이후 신호 중단에 따른 타임아웃과 일시적인 미검출에 대비한 정지 유지 시간을 적용합니다.
 
 ## 실행 환경
 
@@ -26,9 +26,9 @@ ROS2 기반 TurtleBot3 Waffle-Pi 주행 프로젝트입니다. 정적 점유 지
 | 로봇 | TurtleBot3 Waffle-Pi |
 | 언어 | Python 3 |
 
-주행 모드는 NumPy와 ROS2의 `rclpy`, `geometry_msgs`, `nav_msgs`, `tf2_ros`를 사용합니다. 실행 준비에는 TurtleBot3 bringup, Nav2의 지도 제공·AMCL 위치 추정, RViz2가 필요합니다.
+주행 모드는 NumPy와 ROS2의 `rclpy`, `geometry_msgs`, `nav_msgs`, `std_msgs`, `tf2_ros`를 사용합니다. 실행 준비에는 TurtleBot3 bringup, Nav2의 지도 제공·AMCL 위치 추정, RViz2가 필요합니다.
 
-검출 모드는 추가로 `sensor_msgs`, `cv_bridge`, GUI를 지원하는 OpenCV, Ultralytics와 PyTorch가 필요합니다. 검출용 라이브러리는 검출 모드에서만 불러옵니다. 검출 모드만 시험할 때에는 카메라 토픽과 ROS2 통신이 필요하며, 지도·AMCL·RViz는 필요하지 않습니다.
+검출 모드는 추가로 `sensor_msgs`, `cv_bridge`, GUI를 지원하는 OpenCV, Ultralytics와 PyTorch가 필요합니다. 검출용 라이브러리는 검출 모드에서만 불러옵니다. 검출 모드의 영상 처리에는 카메라 토픽과 ROS2 통신이 필요하며, 지도·AMCL·RViz는 필요하지 않습니다.
 
 기존 실습에서 확인한 import 환경은 Python `3.10.12`, OpenCV `5.0.0`, NumPy `1.26.4`, Ultralytics `8.4.177`이며, `cv_bridge` import도 확인하였습니다. 기존 환경이 준비되어 있다면 패키지를 다시 설치하거나 일괄 업그레이드할 필요가 없습니다.
 
@@ -43,7 +43,7 @@ python3 astar_pure_pursuit_turtlebot.py
 # 명시적으로 주행 모드 선택
 python3 astar_pure_pursuit_turtlebot.py --mode drive
 
-# 카메라 객체 검출 화면만 실행
+# 카메라 객체 검출 화면 실행
 python3 astar_pure_pursuit_turtlebot.py --mode detect
 ```
 
@@ -145,7 +145,7 @@ python3 astar_pure_pursuit_turtlebot.py --mode detect --ros-args \
   -p image_size:=640
 ```
 
-검출 설정과 기본값은 [프로그램 사양](resources/architecture.md)에 정리합니다. 영상 구독 콜백은 최신 메시지 한 개를 보관하고, 별도 메인 루프가 영상 변환·추론·화면 표시를 수행합니다. 모든 카메라 프레임을 차례대로 처리하는 방식은 아닙니다.
+검출 설정과 기본값은 [프로그램 사양](resources/architecture.md)에 정리합니다. 특정 객체 정지 조건은 기본적으로 `scissors`이며, `stop_classes` 파라미터로 바꿀 수 있습니다. 신뢰도 기준을 `0.5`로 지정하려면 `-p confidence_threshold:=0.5`를 추가합니다. 영상 구독 콜백은 최신 메시지 한 개를 보관하고, 별도 메인 루프가 영상 변환·추론·화면 표시를 수행합니다. 모든 카메라 프레임을 차례대로 처리하는 방식은 아닙니다.
 
 ### 4. 화면 확인과 종료
 
@@ -153,10 +153,10 @@ python3 astar_pure_pursuit_turtlebot.py --mode detect --ros-args \
 - `Inference`는 Ultralytics가 제공하는 프레임별 추론 시간입니다.
 - `Process FPS`는 최근 2초 안의 처리 완료 시각 간격으로 계산합니다. 첫 프레임이나 최근 완료 기록이 하나뿐인 경우에는 `0.0`을 표시합니다. 카메라 발행 FPS와는 다릅니다.
 - `Receive age`는 현재 처리 대상으로 받은 메시지의 검출 노드 수신 콜백 실행 이후 경과 시간입니다. 촬영부터 화면 표시까지의 전체 지연을 측정한 값은 아닙니다.
-- 영상을 기다리는 동안에는 대기 화면을 표시합니다. 수신 갱신이 기본 2초를 초과하여 중단되면 마지막 영상에 `IMAGE STREAM TIMEOUT`을 표시합니다. 이 표시는 주행 정지 명령과 연결되지 않습니다.
+- 영상을 기다리는 동안에는 대기 화면을 표시합니다. 마지막 처리 영상의 수신 시각으로부터 기본 2초가 지나면 `IMAGE STREAM TIMEOUT`을 표시합니다. 영상 수신 중단뿐 아니라 추론 지연 시에도 나타날 수 있습니다. 검출 상태를 한 번 수신한 주행 노드는 새 상태 메시지가 3초 넘게 끊기면 정지합니다.
 - 화면에 초점을 둔 상태에서 **ESC 또는 q**, 또는 터미널의 **Ctrl+C**로 종료합니다. 추론 중에는 화면 이벤트 처리가 해당 추론이 끝날 때까지 지연될 수 있습니다.
 
-기존 단독 검출에서 실제 카메라 영상의 OpenCV 변환과 YOLO 검출 동작을 확인하였습니다. 두 모드를 함께 실행하였을 때에도 주행 중 카메라 영상 갱신과 객체 검출을 확인하였습니다.
+실제 카메라 영상의 OpenCV 변환과 YOLO 검출 동작을 확인하였습니다. 두 모드를 함께 실행하였을 때에도 주행 중 카메라 영상 갱신과 객체 검출을 확인하였습니다.
 
 ### 5. 주행과 검출 동시 실행
 
@@ -172,13 +172,38 @@ python3 astar_pure_pursuit_turtlebot.py --ros-args -p use_sim_time:=false
 python3 astar_pure_pursuit_turtlebot.py --mode detect --ros-args -p use_sim_time:=false
 ```
 
-영상 수신과 검출 화면이 정상인지 확인한 뒤 RViz에서 목표를 지정하여 주행하면서 검출 화면의 갱신을 확인합니다. 검출 프로세스는 `/cmd_vel`을 발행하지 않으며, 물체 검출에 따른 주행 정지는 아직 구현되어 있지 않습니다. 주행 중 카메라 영상 갱신과 객체 검출이 함께 동작하는 것을 확인하였습니다.
+영상 수신과 검출 화면이 정상인지 확인한 뒤 RViz에서 목표를 지정하여 주행하면서 검출 화면의 갱신을 확인합니다. 검출 프로세스는 `/cmd_vel`을 발행하지 않으며, 물체 검출에 따른 주행 정지는 `/yolo/stop_requested`를 수신한 주행 노드에서 처리합니다.
+
+기본 검출 신뢰도는 `0.25`, 정지 대상은 `scissors`입니다. 다른 객체를 정지 대상으로 지정하거나 신뢰도 기준을 변경하려면 검출 모드 명령에 다음 옵션을 추가합니다.
+
+```bash
+python3 astar_pure_pursuit_turtlebot.py --mode detect --ros-args \
+  -p use_sim_time:=false \
+  -p stop_classes:="person,chair" \
+  -p confidence_threshold:=0.5
+```
+
+YOLOv8n은 COCO 80개 클래스를 대상으로 검출하며, **정지 요청은 `stop_classes`로 지정한 객체가 검출되었을 때에만** 발생합니다. 정확한 영문 클래스 이름은 [Ultralytics COCO 클래스 목록(`coco.yaml`)](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/datasets/coco.yaml)에서 확인할 수 있습니다.
+
+검출 모드는 `/yolo/stop_requested`(`std_msgs/msg/Bool`)에 정지 요청을 발행합니다. `data: true`는 정지 요청, `data: false`는 해제를 의미하며, 주행 모드는 `true`를 받으면 `/cmd_vel`에 속도가 모두 0인 `Twist`를 발행합니다. 지정 객체가 사라지면 기본 1초의 정지 유지 시간이 지난 뒤, 새 영상에서 `false`가 발행되어 주행을 재개할 수 있습니다.
+
+```bash
+# 검출 상태 확인
+ros2 topic echo /yolo/stop_requested
+
+# 별도 터미널에서 속도 명령 확인
+ros2 topic echo /cmd_vel
+```
+
+검출 상태를 한 번 수신한 뒤 검출 모드가 종료되거나 상태 메시지가 끊기면 주행 노드는 정지 상태를 유지할 수 있습니다. 검출 모드를 다시 실행하여 정상 상태를 수신하면 정지 조건을 해제할 수 있습니다. 검출 모드 자체는 `/cmd_vel`을 발행하지 않습니다.
+
+정지 동작은 지정 객체의 **검출 여부**를 기준으로 하며, 물체까지의 거리를 측정하거나 물리적 비상정지를 대체하지 않습니다.
 
 ## 현재 범위
 
-주행 노드는 정적 지도를 기반으로 경로를 계획하며, `/scan`을 이용한 실시간 충돌 검사와 객체 검출 기반 비상정지는 아직 구현되어 있지 않습니다. 장애물 부근이나 좁은 코너에서는 계획 경로와 실제 주행 궤적이 달라질 수 있어 추가 개선이 필요합니다.
+주행 노드는 정적 지도를 기반으로 경로를 계획하며, 특정 YOLO 객체 검출 시 정지 명령을 발행합니다. 그러나 `/scan`을 이용한 실시간 충돌 검사와 실제 거리 측정은 구현되어 있지 않습니다. 장애물 부근이나 좁은 코너에서는 계획 경로와 실제 주행 궤적이 달라질 수 있어 추가 개선이 필요합니다.
 
-검출 모드는 결과를 화면에 표시하며, 검출 결과를 주행 노드로 전달하거나 `/cmd_vel`을 발행하지 않습니다. 두 프로세스는 같은 PC의 CPU·메모리를 사용하므로 실행 흐름을 분리하여도 자원 경쟁은 발생할 수 있습니다.
+검출 모드는 결과를 화면에 표시하고 `/yolo/stop_requested`를 발행하지만 `/cmd_vel`을 직접 발행하지 않습니다. 두 프로세스는 같은 PC의 CPU·메모리를 사용하므로 실행 흐름을 분리하여도 자원 경쟁은 발생할 수 있습니다.
 
 실제 로봇은 통제된 공간에서 저속으로 시험하며, 다른 `/cmd_vel` 발행 노드와 동시에 주행하지 않습니다.
 
